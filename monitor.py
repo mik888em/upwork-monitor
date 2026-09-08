@@ -187,10 +187,33 @@ def load_state() -> set[str]:
 
 
 def _write_state(seen: set[str]) -> None:
-    STATE_DIR.mkdir(exist_ok=True)
-    tmp = GLOBAL_STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(seen), indent=2))
-    tmp.rename(GLOBAL_STATE_FILE)
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = GLOBAL_STATE_FILE.with_suffix(
+        ".tmp"
+    )
+
+    tmp.write_text(
+        json.dumps(
+            sorted(seen),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # IMPORTANT FOR WINDOWS:
+    #
+    # Path.rename() / os.rename() cannot replace an existing destination
+    # file on Windows and raises WinError 183.
+    #
+    # Path.replace() uses replacement semantics and atomically replaces
+    # the existing seen_global.json.
+    tmp.replace(
+        GLOBAL_STATE_FILE
+    )
 
 
 def save_state(seen: set[str]) -> None:
