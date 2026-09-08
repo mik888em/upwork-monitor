@@ -19,14 +19,15 @@ Configuration:
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
+from bs4 import BeautifulSoup
 import nodriver as uc
 from dotenv import load_dotenv
 from settings import SEARCH_URLS, SKIP_COUNTRIES, MIN_FIXED_BUDGET, COUNTRY_FLAGS
@@ -35,7 +36,7 @@ from settings import SEARCH_URLS, SKIP_COUNTRIES, MIN_FIXED_BUDGET, COUNTRY_FLAG
 
 load_dotenv(Path(__file__).parent / ".env")
 
-TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL:   str = os.environ.get("TELEGRAM_CHANNEL", "-5087355913")
 
 BASE_URL  = "https://www.upwork.com"
@@ -94,100 +95,334 @@ def save_state(seen: set[str]) -> None:
 
 # ── HTML parsing ──────────────────────────────────────────────────────────────
 
-def strip_tags(html: str) -> str:
-    return re.sub(r"<[^>]+>", "", html).strip()
+def clean_text(value) -> str:
+    if value is None:
+        return ""
+
+    if hasattr(value, "get_text"):
+        value = value.get_text(" ", strip=True)
+
+    return " ".join(str(value).split()).strip()
+
+
+def select_first(element, selectors):
+    for selector in selectors:
+        try:
+            found = element.select_one(selector)
+        except Exception:
+            found = None
+
+        if found is not None:
+            return found
+
+    return None
+
+
+def select_text(element, selectors) -> str:
+    found = select_first(
+        element,
+        selectors,
+    )
+
+    if found is None:
+        return ""
+
+    return clean_text(found)
+
+
+def extract_job_url(card) -> str:
+    anchor = select_first(
+        card,
+        [
+            '[data-test*="job-tile-title-link"][href]',
+            '[data-test*="job-tile-title"] a[href]',
+            'h2 a[href*="/jobs/"]',
+            'a[href*="/jobs/"]',
+        ],
+    )
+
+    if anchor is None:
+        return ""
+
+    href = clean_text(
+        anchor.get("href", "")
+    )
+
+    if not href:
+        return ""
+
+    return urljoin(
+        BASE_URL,
+        href,
+    ).split("?", 1)[0]
+
+
+def extract_job_uid(card, job_url: str) -> str:
+    for attribute in (
+        "data-ev-job-uid",
+        "data-test-key",
+        "data-job-uid",
+        "data-job-id",
+    ):
+        value = clean_text(
+            card.get(attribute, "")
+        )
+
+        if value:
+            return value
+
+    match = re.search(
+        r"/jobs/~0?(\d+)",
+        job_url,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1)
+
+    return ""
+
+
+def extract_skills(card) -> list[str]:
+    selectors = [
+        '[data-test="token"]',
+        '[data-test*="TokenClamp"] [data-test="token"]',
+        '.air3-token-container [data-test="token"]',
+    ]
+
+    for selector in selectors:
+        try:
+            elements = card.select(selector)
+        except Exception:
+            elements = []
+
+        values = []
+
+        for element in elements:
+            value = clean_text(element)
+
+            if value and value not in values:
+                values.append(value)
+
+        if values:
+            return values
+
+    return []
+
+
+def extract_fixed_budget(card) -> str:
+    fixed = select_first(
+        card,
+        [
+            '[data-test="is-fixed-price"]',
+            '[data-test*="fixed-price"]',
+        ],
+    )
+
+    if fixed is None:
+        return ""
+
+    text = clean_text(fixed)
+
+    match = re.search(
+        r"\$\s*([\d,]+(?:\.\d+)?)",
+        text,
+    )
+
+    if not match:
+        return ""
+
+    return "$" + match.group(1)
 
 
 def parse_tiles(html: str) -> list[dict]:
-    """Extract job data from Upwork search results HTML."""
-    jobs = []
-    tiles = re.findall(
-        r'(<article[^>]*data-test="JobTile"[^>]*>.*?</article>)',
-        html, re.DOTALL,
+    """
+    Parse current Upwork search-result cards.
+
+    Verified against the current public Upwork DOM on 2026-09-08.
+
+    Current primary selector:
+        article.job-tile
+
+    Older fallback selectors are kept for compatibility.
+    """
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
     )
-    print(f"  Tiles found: {len(tiles)}", flush=True)
 
-    for tile in tiles:
-        job: dict = {}
+    cards = soup.select(
+        "article.job-tile"
+    )
 
-        # UID
-        m = re.search(r'data-ev-job-uid="(\d+)"', tile)
-        job["uid"] = m.group(1) if m else ""
-
-        # URL (clean, no query params)
-        m = re.search(r'href="(/jobs/[^"]+)"[^>]*data-ev-label="link"', tile)
-        if not m:
-            m = re.search(r'data-ev-label="link"[^>]*href="(/jobs/[^"]+)"', tile)
-        if m:
-            job["url"] = BASE_URL + m.group(1).split("?")[0]
-        else:
-            job["url"] = f"{BASE_URL}/jobs/~0{job['uid']}" if job.get("uid") else ""
-
-        # Title
-        m = re.search(r'data-test="job-tile-title-link[^"]*"[^>]*>(.*?)</a>', tile, re.DOTALL)
-        job["title"] = strip_tags(m.group(1)) if m else ""
-
-        # Posted date
-        m = re.search(
-            r'data-test="job-pubilshed-date"[^>]*>.*?<span[^>]*>[^<]+</span>\s*<span[^>]*>([^<]+)</span>',
-            tile, re.DOTALL,
-        )
-        job["posted"] = m.group(1).strip() if m else ""
-
-        # Job type / rate
-        m = re.search(r'data-test="job-type-label"[^>]*><strong>([^<]+)</strong>', tile)
-        job["rate"] = m.group(1).strip() if m else ""
-
-        # Fixed price budget
-        m = re.search(
-            r'data-test="is-fixed-price".*?Est\. budget:.*?<strong[^>]*>\$?([\d,\.]+)</strong>',
-            tile, re.DOTALL,
-        )
-        job["fixed_budget"] = f"${m.group(1)}" if m else ""
-
-        # Experience level
-        m = re.search(r'data-test="experience-level"[^>]*><strong>([^<]+)</strong>', tile)
-        job["level"] = m.group(1).strip() if m else ""
-
-        # Description snippet
-        m = re.search(r'data-test="[^"]*JobDescription[^"]*".*?<p[^>]*>(.*?)</p>', tile, re.DOTALL)
-        job["description"] = strip_tags(m.group(1))[:300] if m else ""
-
-        # Required skills
-        job["skills"] = re.findall(
-            r'data-test="token"[^>]*><span[^>]*>([^<]+)</span>', tile,
+    if not cards:
+        cards = soup.select(
+            'article[data-test="JobTile"]'
         )
 
-        # Client info (basic — enriched later from job page)
-        job["payment_verified"] = bool(re.search(r"Payment method verified", tile))
-        m = re.search(r'data-test="total-spent"[^>]*><strong>([^<]+)</strong>', tile)
-        if not m:
-            m = re.search(r"(\$[\d,\.]+[KMk+]*)\s*(?:spent|total)", tile)
-        job["spent"] = m.group(1).strip() if m else ""
+    if not cards:
+        cards = soup.select(
+            '[data-test="JobTile"]'
+        )
 
-        m = re.search(r'data-test="client-rating"[^>]*aria-label="([\d\.]+)', tile)
-        if not m:
-            m = re.search(
-                r'data-test="client-rating"[^>]*>.*?<span[^>]*>([\d\.]+)</span>',
-                tile, re.DOTALL,
+    print(
+        f"  Tiles found: {len(cards)}",
+        flush=True,
+    )
+
+    jobs = []
+
+    for card in cards:
+        job = {}
+
+        job_url = extract_job_url(card)
+
+        job["uid"] = extract_job_uid(
+            card,
+            job_url,
+        )
+
+        job["url"] = job_url
+
+        job["title"] = select_text(
+            card,
+            [
+                '[data-test*="job-tile-title-link"]',
+                '[data-test*="job-tile-title"] a',
+                'h2 a[href*="/jobs/"]',
+                "h2",
+            ],
+        )
+
+        job["posted"] = select_text(
+            card,
+            [
+                '[data-test="job-pubilshed-date"]',
+                '[data-test="PostedOn"]',
+                '[data-test*="published-date"]',
+                "time",
+            ],
+        )
+
+        job["rate"] = select_text(
+            card,
+            [
+                '[data-test="job-type-label"]',
+            ],
+        )
+
+        job["fixed_budget"] = extract_fixed_budget(
+            card
+        )
+
+        job["level"] = select_text(
+            card,
+            [
+                '[data-test="experience-level"]',
+                '[data-test*="experience"]',
+            ],
+        )
+
+        job["description"] = select_text(
+            card,
+            [
+                '[data-test*="JobDescription"] p',
+                '[data-test*="job-description"] p',
+                ".air3-line-clamp p",
+                "p",
+            ],
+        )[:300]
+
+        job["skills"] = extract_skills(
+            card
+        )
+
+        card_text = clean_text(card)
+
+        job["payment_verified"] = (
+            "Payment method verified"
+            in card_text
+        )
+
+        job["spent"] = select_text(
+            card,
+            [
+                '[data-test="total-spent"]',
+                '[data-test*="total-spent"]',
+            ],
+        )
+
+        rating_element = select_first(
+            card,
+            [
+                '[data-test="client-rating"]',
+                '[data-test*="client-rating"]',
+            ],
+        )
+
+        job["rating"] = ""
+
+        if rating_element is not None:
+            job["rating"] = clean_text(
+                rating_element.get(
+                    "aria-label",
+                    "",
+                )
             )
-        job["rating"] = m.group(1).strip() if m else ""
 
-        m = re.search(
-            r'data-test="client-location"[^>]*>.*?<strong[^>]*>([^<]+)</strong>',
-            tile, re.DOTALL,
+            if not job["rating"]:
+                job["rating"] = clean_text(
+                    rating_element
+                )
+
+        job["country"] = select_text(
+            card,
+            [
+                '[data-test="client-location"] strong',
+                '[data-test="client-location"]',
+                '[data-test*="client-location"]',
+            ],
         )
-        if not m:
-            m = re.search(r"location[^>]*>.*?<span[^>]*>([^<]+)</span>", tile, re.DOTALL)
-        job["country"] = m.group(1).strip() if m else ""
 
-        m = re.search(r"Proposals:\s*<strong>([^<]+)</strong>", tile)
-        if not m:
-            m = re.search(r'data-test="proposals"[^>]*>.*?(\d[^<]*)</span>', tile, re.DOTALL)
-        job["proposals"] = m.group(1).strip() if m else ""
+        proposals_match = re.search(
+            r"Proposals:\s*"
+            r"(Less than \d+|\d+\s+to\s+\d+|\d+\+?)",
+            card_text,
+            re.IGNORECASE,
+        )
 
-        if job.get("uid") and job.get("title"):
-            jobs.append(job)
+        job["proposals"] = (
+            proposals_match.group(1).strip()
+            if proposals_match
+            else ""
+        )
+
+        if not job["uid"]:
+            print(
+                f"  Skip card without UID: "
+                f"{job['title'][:80]}",
+                flush=True,
+            )
+            continue
+
+        if not job["title"]:
+            print(
+                f"  Skip UID {job['uid']}: "
+                "title is empty",
+                flush=True,
+            )
+            continue
+
+        if not job["url"]:
+            print(
+                f"  Skip UID {job['uid']}: "
+                "URL is empty",
+                flush=True,
+            )
+            continue
+
+        jobs.append(job)
 
     return jobs
 
@@ -469,17 +704,19 @@ async def main(url_idx: int) -> None:
 
 
 if __name__ == "__main__":
-    lock_fd = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("Another instance is running — exiting.", flush=True)
-        sys.exit(0)
+    idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
-    try:
-        idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-        SEARCH_URLS[:] = [SEARCH_URLS[idx]]
-        uc.loop().run_until_complete(main(idx))
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
+    if idx < 0 or idx >= len(SEARCH_URLS):
+        print(
+            f"Invalid search index: {idx}",
+            flush=True,
+        )
+        sys.exit(2)
+
+    SEARCH_URLS[:] = [
+        SEARCH_URLS[idx]
+    ]
+
+    uc.loop().run_until_complete(
+        main(idx)
+    )

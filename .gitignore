@@ -18,3 +18,9 @@ venv/
 
 # Debug files
 debug_client.log
+
+# Local Upwork validation artifacts
+_smoke/
+_smoke_nodriver.py
+_validate_*.py
+_step5a_patch.py
