@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import msvcrt
 import os
 import re
 import sys
@@ -70,6 +71,81 @@ TELEGRAM_CHANNEL:   str = os.environ.get("TELEGRAM_CHANNEL", "").strip()
 BASE_URL  = "https://www.upwork.com"
 STATE_DIR = Path(__file__).parent / "state"
 LOCK_FILE = Path(__file__).parent / "monitor.lock"
+
+
+# ── Windows single-instance lock ──────────────────────────────────────────────
+
+def acquire_single_instance_lock():
+    """
+    Acquire a non-blocking one-byte Windows file lock.
+
+    Returns:
+        open file handle -> lock acquired
+        None             -> another monitor is already running
+    """
+
+    LOCK_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    handle = open(
+        LOCK_FILE,
+        "a+b",
+    )
+
+    handle.seek(
+        0,
+        2,
+    )
+
+    if handle.tell() == 0:
+        handle.write(
+            b"\0"
+        )
+        handle.flush()
+
+    handle.seek(0)
+
+    try:
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_NBLCK,
+            1,
+        )
+
+    except OSError:
+        handle.close()
+        return None
+
+    return handle
+
+
+def release_single_instance_lock(
+    handle,
+) -> None:
+
+    if handle is None:
+        return
+
+    try:
+        handle.seek(0)
+
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_UNLCK,
+            1,
+        )
+
+    except OSError:
+        pass
+
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
 
 
 # ── State (global deduplication) ──────────────────────────────────────────────
@@ -1206,20 +1282,47 @@ def parse_cli_args():
 
 
 if __name__ == "__main__":
-    args = parse_cli_args()
+    lock_handle = acquire_single_instance_lock()
 
-    if args.dry_run and args.bootstrap:
+    if lock_handle is None:
         print(
-            "ERROR: use either --dry-run or --bootstrap, "
-            "not both.",
+            "SINGLE_INSTANCE_STATUS="
+            "SKIPPED_ALREADY_RUNNING",
             flush=True,
         )
 
-        sys.exit(2)
+        sys.exit(0)
 
-    uc.loop().run_until_complete(
-        run_monitor(
-            dry_run=args.dry_run,
-            bootstrap=args.bootstrap,
-        )
+    print(
+        "SINGLE_INSTANCE_STATUS=ACQUIRED",
+        flush=True,
     )
+
+    try:
+        args = parse_cli_args()
+
+        if args.dry_run and args.bootstrap:
+            print(
+                "ERROR: use either --dry-run "
+                "or --bootstrap, not both.",
+                flush=True,
+            )
+
+            sys.exit(2)
+
+        uc.loop().run_until_complete(
+            run_monitor(
+                dry_run=args.dry_run,
+                bootstrap=args.bootstrap,
+            )
+        )
+
+    finally:
+        release_single_instance_lock(
+            lock_handle
+        )
+
+        print(
+            "SINGLE_INSTANCE_STATUS=RELEASED",
+            flush=True,
+        )
