@@ -18,6 +18,7 @@ Configuration:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -30,14 +31,41 @@ import httpx
 from bs4 import BeautifulSoup
 import nodriver as uc
 from dotenv import load_dotenv
-from settings import SEARCH_URLS, SKIP_COUNTRIES, MIN_FIXED_BUDGET, COUNTRY_FLAGS
+from settings import (
+    BROAD_TOPIC_KEYWORDS,
+    COMPLEXITY_SIGNALS,
+    COUNTRY_FLAGS,
+    EXCLUDE_KEYWORDS,
+    MIN_SIMPLE_SCORE,
+    REQUIRED_CLIENT_COUNTRY,
+    SEARCH_READY_TIMEOUT_SECONDS,
+    SEARCH_URLS,
+    SIMPLE_SIGNALS,
+    STRONG_SIMPLE_KEYWORDS,
+)
+
+# ── Windows UTF-8 console ─────────────────────────────────────────────────────
+
+def configure_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            pass
+
+
+configure_console()
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 load_dotenv(Path(__file__).parent / ".env")
 
-TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL:   str = os.environ.get("TELEGRAM_CHANNEL", "-5087355913")
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL:   str = os.environ.get("TELEGRAM_CHANNEL", "").strip()
 
 BASE_URL  = "https://www.upwork.com"
 STATE_DIR = Path(__file__).parent / "state"
@@ -340,6 +368,8 @@ def parse_tiles(html: str) -> list[dict]:
 
         card_text = clean_text(card)
 
+        job["search_text"] = card_text
+
         job["payment_verified"] = (
             "Payment method verified"
             in card_text
@@ -525,21 +555,144 @@ async def fetch_client_info(browser, job_url: str) -> dict:
         return {}
 
 
-# ── Filtering ─────────────────────────────────────────────────────────────────
+# ── Simple-job filtering ──────────────────────────────────────────────────────
 
-def should_skip(job: dict) -> str | None:
-    """Return a skip reason string, or None if the job should be sent."""
-    country = (job.get("country") or "").strip().lower()
-    if country in SKIP_COUNTRIES:
-        return f"country={job.get('country')}"
+def _phrase_matches(
+    text: str,
+    phrases,
+) -> list[str]:
+    normalized = text.casefold()
 
-    budget_str = job.get("fixed_budget", "")
-    if budget_str:
-        amount = float(re.sub(r"[^\d.]", "", budget_str) or "0")
-        if 0 < amount < MIN_FIXED_BUDGET:
-            return f"fixed_budget={budget_str} < ${MIN_FIXED_BUDGET}"
+    matches = []
 
-    return None
+    for phrase in phrases:
+        if phrase.casefold() in normalized:
+            matches.append(phrase)
+
+    return matches
+
+
+def evaluate_simple_job(
+    job: dict,
+) -> dict:
+    """
+    Decide whether a job looks like the kind of small/simple task
+    we want to alert on.
+
+    Rules:
+
+    1. Explicit exclusion keyword -> reject.
+    2. Complexity / long-term signal -> reject.
+    3. Strong-simple topic -> accept.
+    4. Broad topic such as Python/testing -> requires a simplicity
+       signal such as quick/simple/small/fix/one-time.
+    """
+
+    searchable = job.get("search_text", "")
+
+    if not searchable:
+        searchable = " ".join(
+            [
+                job.get("title", ""),
+                job.get("description", ""),
+                " ".join(
+                    job.get("skills", [])
+                ),
+                job.get("rate", ""),
+                job.get("level", ""),
+            ]
+        )
+
+    strong = _phrase_matches(
+        searchable,
+        STRONG_SIMPLE_KEYWORDS,
+    )
+
+    broad = _phrase_matches(
+        searchable,
+        BROAD_TOPIC_KEYWORDS,
+    )
+
+    simple = _phrase_matches(
+        searchable,
+        SIMPLE_SIGNALS,
+    )
+
+    complexity = _phrase_matches(
+        searchable,
+        COMPLEXITY_SIGNALS,
+    )
+
+    excluded = _phrase_matches(
+        searchable,
+        EXCLUDE_KEYWORDS,
+    )
+
+    score = 0
+
+    if strong:
+        score += 5
+
+    if broad:
+        score += 2
+
+    if simple:
+        score += 3
+
+    positive_matches = []
+
+    for group in (
+        strong,
+        broad,
+        simple,
+    ):
+        for value in group:
+            if value not in positive_matches:
+                positive_matches.append(value)
+
+    if excluded:
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                "excluded keyword: "
+                + ", ".join(excluded)
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+        }
+
+    if complexity:
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                "complex/long-term signal: "
+                + ", ".join(complexity)
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+        }
+
+    if score < MIN_SIMPLE_SCORE:
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                f"score {score} < "
+                f"{MIN_SIMPLE_SCORE}"
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+        }
+
+    return {
+        "accepted": True,
+        "score": score,
+        "reason": "simple-job filter matched",
+        "matches": positive_matches,
+        "complexity": complexity,
+    }
 
 
 # ── Telegram formatting ───────────────────────────────────────────────────────
@@ -622,10 +775,28 @@ def format_job(job: dict) -> str:
 
 # ── Telegram sender ───────────────────────────────────────────────────────────
 
-async def send_telegram(text: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+async def send_telegram(
+    text: str,
+) -> None:
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not configured in .env"
+        )
+
+    if not TELEGRAM_CHANNEL:
+        raise RuntimeError(
+            "TELEGRAM_CHANNEL is not configured in .env"
+        )
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}"
+        "/sendMessage"
+    )
+
     async with httpx.AsyncClient() as client:
-        r = await client.post(
+        response = await client.post(
             url,
             json={
                 "chat_id": TELEGRAM_CHANNEL,
@@ -633,90 +804,422 @@ async def send_telegram(text: str) -> None:
                 "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": True,
             },
-            timeout=10,
+            timeout=20,
         )
-        print(f"  TG: {r.status_code}", flush=True)
-        if r.status_code != 200:
-            print(f"  TG error: {r.text}", flush=True)
+
+    print(
+        f"  TG: {response.status_code}",
+        flush=True,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Telegram API error "
+            f"{response.status_code}: "
+            f"{response.text}"
+        )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main(url_idx: int) -> None:
-    seen = load_state()
-    print(f"[url_{url_idx}] Known UIDs: {len(seen)}", flush=True)
+async def wait_for_search_ready(
+    page,
+) -> int:
+    """
+    Wait until the real Upwork search results appear.
 
-    browser = await uc.start(headless=False)
-    all_jobs: list[dict] = []
+    We do not click or solve a challenge. We only wait for the same
+    automatic Cloudflare transition already verified on this machine.
+    """
+
+    for second in range(
+        1,
+        SEARCH_READY_TIMEOUT_SECONDS + 1,
+    ):
+        await asyncio.sleep(1)
+
+        try:
+            title = await page.evaluate(
+                "document.title || ''"
+            )
+        except Exception:
+            title = ""
+
+        try:
+            tile_count = await page.evaluate(
+                "document.querySelectorAll("
+                "'article.job-tile'"
+                ").length"
+            )
+        except Exception:
+            tile_count = 0
+
+        try:
+            tile_count = int(tile_count)
+        except Exception:
+            tile_count = 0
+
+        print(
+            f"  ready={second:02d}s "
+            f"title={str(title)!r} "
+            f"tiles={tile_count}",
+            flush=True,
+        )
+
+        if tile_count > 0:
+            return tile_count
+
+    raise RuntimeError(
+        "Upwork search results did not become ready "
+        f"within {SEARCH_READY_TIMEOUT_SECONDS} seconds."
+    )
+
+
+def _save_seen_after_change(
+    seen: set[str],
+    dry_run: bool,
+) -> None:
+
+    if not dry_run:
+        save_state(
+            seen
+        )
+
+
+async def run_monitor(
+    *,
+    dry_run: bool,
+    bootstrap: bool,
+) -> None:
+
+    seen = load_state()
+
+    print(
+        f"Known UIDs: {len(seen)}",
+        flush=True,
+    )
+
+    browser = await uc.start(
+        headless=False
+    )
 
     try:
-        for search_url in SEARCH_URLS:
-            print(f"Opening: ...{search_url[60:100]}", flush=True)
-            page = await browser.get(search_url)
+        search_url = SEARCH_URLS[0]
 
-            # Wait for Cloudflare challenge to pass
-            for _ in range(20):
-                await asyncio.sleep(1)
-                title = await page.evaluate("document.title")
-                if "moment" not in title.lower():
-                    break
-            await asyncio.sleep(3)
+        print(
+            f"Opening US-only search: {search_url}",
+            flush=True,
+        )
 
-            html = await page.get_content()
-            print(f"  HTML: {len(html)} chars", flush=True)
-            all_jobs.extend(parse_tiles(html))
-            await asyncio.sleep(2)
+        page = await browser.get(
+            search_url
+        )
 
-        # Deduplicate within this run (same job in multiple searches)
-        seen_this_run: set[str] = set()
-        unique_jobs = []
-        for job in all_jobs:
-            if job["uid"] not in seen_this_run:
-                seen_this_run.add(job["uid"])
-                unique_jobs.append(job)
+        browser_tile_count = await wait_for_search_ready(
+            page
+        )
 
-        # Only jobs we haven't seen before
-        new_jobs = [j for j in unique_jobs if j["uid"] not in seen]
-        print(f"Jobs parsed: {len(unique_jobs)}, new: {len(new_jobs)}", flush=True)
+        print(
+            f"Browser tiles ready: {browser_tile_count}",
+            flush=True,
+        )
+
+        await asyncio.sleep(2)
+
+        html = await page.get_content()
+
+        print(
+            f"HTML: {len(html)} chars",
+            flush=True,
+        )
+
+        jobs = parse_tiles(
+            html
+        )
+
+        print(
+            f"Jobs parsed: {len(jobs)}",
+            flush=True,
+        )
+
+        if not jobs:
+            raise RuntimeError(
+                "No jobs parsed from current Upwork search."
+            )
+
+        # --------------------------------------------------------------
+        # Bootstrap:
+        # mark everything currently visible as already seen,
+        # without Telegram and without opening individual job pages.
+        # --------------------------------------------------------------
+
+        if bootstrap:
+            added = 0
+
+            for job in jobs:
+                uid = job["uid"]
+
+                if uid not in seen:
+                    seen.add(uid)
+                    added += 1
+
+            save_state(
+                seen
+            )
+
+            print(
+                f"BOOTSTRAP_ADDED={added}",
+                flush=True,
+            )
+
+            print(
+                f"BOOTSTRAP_TOTAL_SEEN={len(seen)}",
+                flush=True,
+            )
+
+            print(
+                "BOOTSTRAP_STATUS=OK",
+                flush=True,
+            )
+
+            return
+
+        # --------------------------------------------------------------
+        # Only jobs not handled before.
+        # --------------------------------------------------------------
+
+        new_jobs = [
+            job
+            for job in jobs
+            if job["uid"] not in seen
+        ]
+
+        print(
+            f"New jobs: {len(new_jobs)}",
+            flush=True,
+        )
+
+        accepted_count = 0
+        us_verified_count = 0
+        sent_count = 0
 
         for job in new_jobs:
-            if job.get("url"):
-                print(f"  Fetching client info: {job['title'][:50]}", flush=True)
-                client_info = await fetch_client_info(browser, job["url"])
-                job.update(client_info)
+            uid = job["uid"]
 
-            skip_reason = should_skip(job)
-            if skip_reason:
-                print(f"  SKIP ({skip_reason}): {job['title'][:50]}", flush=True)
-                seen.add(job["uid"])
+            evaluation = evaluate_simple_job(
+                job
+            )
+
+            if not evaluation["accepted"]:
+                print(
+                    f"FILTER REJECT [{uid}] "
+                    f"{job['title'][:80]} | "
+                    f"{evaluation['reason']} | "
+                    f"score={evaluation['score']}",
+                    flush=True,
+                )
+
+                if not dry_run:
+                    seen.add(uid)
+
+                    _save_seen_after_change(
+                        seen,
+                        dry_run,
+                    )
+
                 continue
 
-            print(f"  Sending: {job['title'][:60]}", flush=True)
-            await send_telegram(format_job(job))
-            await asyncio.sleep(0.5)
-            seen.add(job["uid"])
+            accepted_count += 1
+
+            job["matched_keywords"] = (
+                evaluation["matches"]
+            )
+
+            print(
+                f"FILTER ACCEPT [{uid}] "
+                f"{job['title'][:80]} | "
+                f"score={evaluation['score']} | "
+                f"matches="
+                f"{', '.join(evaluation['matches'])}",
+                flush=True,
+            )
+
+            # ----------------------------------------------------------
+            # Strict secondary US verification.
+            # ----------------------------------------------------------
+
+            print(
+                f"  Fetching client info: "
+                f"{job['title'][:70]}",
+                flush=True,
+            )
+
+            client_info = await fetch_client_info(
+                browser,
+                job["url"],
+            )
+
+            job.update(
+                client_info
+            )
+
+            country = clean_text(
+                job.get(
+                    "country",
+                    "",
+                )
+            )
+
+            if not country:
+                print(
+                    f"COUNTRY UNVERIFIED [{uid}] "
+                    "No client country was extracted. "
+                    "Fail closed; not sending.",
+                    flush=True,
+                )
+
+                # Do not mark as seen.
+                # If it is still visible next run,
+                # client-info retrieval can retry.
+                continue
+
+            if (
+                country.casefold()
+                != REQUIRED_CLIENT_COUNTRY.casefold()
+            ):
+                print(
+                    f"COUNTRY REJECT [{uid}] "
+                    f"client={country!r}",
+                    flush=True,
+                )
+
+                if not dry_run:
+                    seen.add(uid)
+
+                    _save_seen_after_change(
+                        seen,
+                        dry_run,
+                    )
+
+                continue
+
+            us_verified_count += 1
+
+            print(
+                f"US VERIFIED [{uid}] "
+                f"{job['title'][:80]}",
+                flush=True,
+            )
+
+            if dry_run:
+                print(
+                    f"DRY_RUN_WOULD_SEND [{uid}] "
+                    f"{job['title']}",
+                    flush=True,
+                )
+
+                continue
+
+            await send_telegram(
+                format_job(
+                    job
+                )
+            )
+
+            sent_count += 1
+
+            seen.add(uid)
+
+            _save_seen_after_change(
+                seen,
+                dry_run,
+            )
+
+            await asyncio.sleep(
+                0.5
+            )
+
+        print(
+            f"FILTER_ACCEPTED={accepted_count}",
+            flush=True,
+        )
+
+        print(
+            f"US_VERIFIED={us_verified_count}",
+            flush=True,
+        )
+
+        print(
+            f"TELEGRAM_SENT={sent_count}",
+            flush=True,
+        )
+
+        print(
+            f"TOTAL_SEEN={len(seen)}",
+            flush=True,
+        )
+
+        if dry_run:
+            print(
+                "DRY_RUN_STATUS=OK",
+                flush=True,
+            )
+        else:
+            print(
+                "RUN_STATUS=OK",
+                flush=True,
+            )
 
     finally:
-        browser.stop()
-        save_state(seen)
+        try:
+            browser.stop()
+        except Exception:
+            pass
 
-    print(f"Done. Total seen UIDs: {len(seen)}", flush=True)
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Windows US-only Upwork simple-job monitor"
+        )
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run Upwork + filters + US verification "
+            "without Telegram or state changes."
+        ),
+    )
+
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help=(
+            "Mark currently visible jobs as seen "
+            "without Telegram."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    args = parse_cli_args()
 
-    if idx < 0 or idx >= len(SEARCH_URLS):
+    if args.dry_run and args.bootstrap:
         print(
-            f"Invalid search index: {idx}",
+            "ERROR: use either --dry-run or --bootstrap, "
+            "not both.",
             flush=True,
         )
+
         sys.exit(2)
 
-    SEARCH_URLS[:] = [
-        SEARCH_URLS[idx]
-    ]
-
     uc.loop().run_until_complete(
-        main(idx)
+        run_monitor(
+            dry_run=args.dry_run,
+            bootstrap=args.bootstrap,
+        )
     )
