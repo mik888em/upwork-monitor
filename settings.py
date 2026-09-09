@@ -85,6 +85,19 @@ STRONG_SIMPLE_KEYWORDS = (
     "product listing",
     "product data entry",
     "content upload",
+    "flyer",
+    "flyer design",
+    "print design",
+    "print ready",
+    "print-ready",
+    "brochure",
+    "prepress",
+    "business listings",
+    "local business listings",
+    "google business profile",
+    "google my business",
+    "directory listing",
+    "directory listings",
 
     # ------------------------------------------------------------------
     # Google ecosystem
@@ -330,6 +343,34 @@ COMPLEXITY_SIGNALS = (
     "event videographer",
     "event photographer",
     "live event production",
+)
+
+
+# ======================================================================
+# Website / web-project title signals
+#
+# These jobs are often much larger than their descriptions initially
+# suggest. A web-project title must contain an explicit simple/quick
+# signal in the TITLE to be eligible.
+# ======================================================================
+
+WEB_PROJECT_TITLE_SIGNALS = (
+    "website",
+    "web site",
+    "website development",
+    "web development",
+    "website developer",
+    "web developer",
+    "website design",
+    "web design",
+    "rebuild website",
+    "rebuild site",
+    "front-end",
+    "frontend",
+    "wordpress website",
+    "ecommerce website",
+    "shopify website",
+    "landing page",
 )
 
 

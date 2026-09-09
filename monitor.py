@@ -38,6 +38,7 @@ from settings import (
     COUNTRY_FLAGS,
     EXCLUDE_KEYWORDS,
     ROLE_COMPLEXITY_SIGNALS,
+    WEB_PROJECT_TITLE_SIGNALS,
     MINIMIZE_BROWSER_AFTER_READY,
     MAX_SIMPLE_FIXED_BUDGET,
     MIN_SIMPLE_SCORE,
@@ -817,6 +818,16 @@ def evaluate_simple_job(
         or ""
     )
 
+    title_simple = _phrase_matches(
+        title,
+        SIMPLE_SIGNALS,
+    )
+
+    web_project_title = _phrase_matches(
+        title,
+        WEB_PROJECT_TITLE_SIGNALS,
+    )
+
     strong = _phrase_matches(
         searchable,
         STRONG_SIMPLE_KEYWORDS,
@@ -930,15 +941,35 @@ def evaluate_simple_job(
         }
 
     if (
+        web_project_title
+        and not title_simple
+    ):
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                "web project title without "
+                "explicit quick/simple title signal: "
+                + ", ".join(
+                    web_project_title
+                )
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
+        }
+
+    if (
         role_complexity
-        and not simple
+        and not title_simple
     ):
         return {
             "accepted": False,
             "score": score,
             "reason": (
                 "professional role without "
-                "explicit quick/simple signal: "
+                "explicit quick/simple TITLE signal: "
                 + ", ".join(
                     role_complexity
                 )
@@ -1021,7 +1052,16 @@ def format_job(job: dict) -> str:
     if job.get("rating"):
         client_lines.append(f"⭐️ {escape_md(job['rating'])}")
     if job.get("spent"):
-        client_lines.append(f"💰 {escape_md(job['spent'])} spent")
+        spent_text = str(
+            job["spent"]
+        ).strip()
+
+        if "spent" not in spent_text.casefold():
+            spent_text += " spent"
+
+        client_lines.append(
+            f"💰 {escape_md(spent_text)}"
+        )
     if job.get("hires"):
         client_lines.append(f"🤝 {escape_md(job['hires'])}")
     if country:
