@@ -6,6 +6,9 @@ surface genuinely small/simple jobs across several unrelated categories
 while aggressively rejecting substantial professional projects.
 """
 
+from pathlib import Path
+
+
 # ======================================================================
 # Search
 # ======================================================================
@@ -412,11 +415,65 @@ ROLE_COMPLEXITY_SIGNALS = (
 # Explicit exclusions
 # ======================================================================
 
+# Static exclusions can still be committed here if needed. Normally keep
+# this tuple empty and edit the local exclude_keywords.txt instead.
 EXCLUDE_KEYWORDS = (
+)
+
+# Local operator-managed exclusions. This file is intentionally Git-ignored,
+# so you can edit it directly on the VPS without making the repository dirty.
+# Format:
+#   - one keyword or phrase per line
+#   - blank lines are ignored
+#   - lines beginning with # are comments
+#   - matching is case-insensitive in monitor.py
+LOCAL_EXCLUDE_KEYWORDS_FILE = (
+    Path(__file__).resolve().with_name(
+        "exclude_keywords.txt"
+    )
+)
+
+
+def _load_local_exclude_keywords():
+    if not LOCAL_EXCLUDE_KEYWORDS_FILE.is_file():
+        return ()
+
+    try:
+        text = LOCAL_EXCLUDE_KEYWORDS_FILE.read_text(
+            encoding="utf-8-sig"
+        )
+    except (OSError, UnicodeError):
+        return ()
+
+    values = []
+
+    for raw_line in text.splitlines():
+        value = raw_line.strip()
+
+        if not value:
+            continue
+
+        if value.startswith("#"):
+            continue
+
+        values.append(value)
+
+    # Preserve order while removing duplicates.
+    return tuple(
+        dict.fromkeys(values)
+    )
+
+
+EXCLUDE_KEYWORDS = tuple(
+    dict.fromkeys(
+        (
+            *EXCLUDE_KEYWORDS,
+            *_load_local_exclude_keywords(),
+        )
+    )
 )
 
 
 COUNTRY_FLAGS = {
     "United States": "🇺🇸",
 }
-
