@@ -37,6 +37,9 @@ from settings import (
     COMPLEXITY_SIGNALS,
     COUNTRY_FLAGS,
     EXCLUDE_KEYWORDS,
+    ROLE_COMPLEXITY_SIGNALS,
+    MINIMIZE_BROWSER_AFTER_READY,
+    MAX_SIMPLE_FIXED_BUDGET,
     MIN_SIMPLE_SCORE,
     REQUIRED_CLIENT_COUNTRY,
     SEARCH_READY_TIMEOUT_SECONDS,
@@ -660,47 +663,159 @@ def _phrase_matches(
     text: str,
     phrases,
 ) -> list[str]:
-    normalized = text.casefold()
+    """
+    Match phrases using token/phrase boundaries.
+
+    The previous implementation used:
+
+        phrase in text
+
+    which caused false positives such as:
+
+        "script"  inside "description"
+        "api"     inside unrelated longer words
+
+    Whitespace inside multi-word phrases is flexible.
+    """
+
+    normalized = (
+        text or ""
+    ).casefold()
 
     matches = []
 
     for phrase in phrases:
-        if phrase.casefold() in normalized:
-            matches.append(phrase)
+        candidate = (
+            phrase or ""
+        ).casefold().strip()
+
+        if not candidate:
+            continue
+
+        pattern = re.escape(
+            candidate
+        )
+
+        # Allow one or more whitespace characters between words.
+        pattern = pattern.replace(
+            r"\ ",
+            r"\s+",
+        )
+
+        # English keyword boundary at the beginning.
+        if candidate[0].isalnum():
+            pattern = (
+                r"(?<![0-9a-z])"
+                + pattern
+            )
+
+        # English keyword boundary at the end.
+        if candidate[-1].isalnum():
+            pattern = (
+                pattern
+                + r"(?![0-9a-z])"
+            )
+
+        if re.search(
+            pattern,
+            normalized,
+        ):
+            matches.append(
+                phrase
+            )
 
     return matches
+
+
+def _fixed_budget_amount(
+    job: dict,
+):
+    value = (
+        job.get(
+            "fixed_budget",
+            "",
+        )
+        or ""
+    )
+
+    match = re.search(
+        r"(\d[\d,]*(?:\.\d+)?)",
+        value,
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(
+            match.group(1).replace(
+                ",",
+                "",
+            )
+        )
+
+    except ValueError:
+        return None
 
 
 def evaluate_simple_job(
     job: dict,
 ) -> dict:
     """
-    Decide whether a job looks like the kind of small/simple task
-    we want to alert on.
+    Decide whether a job belongs to our small/simple-job alert set.
 
-    Rules:
+    Decision order:
 
     1. Explicit exclusion keyword -> reject.
-    2. Complexity / long-term signal -> reject.
-    3. Strong-simple topic -> accept.
-    4. Broad topic such as Python/testing -> requires a simplicity
-       signal such as quick/simple/small/fix/one-time.
+    2. Hard complexity / long engagement -> reject.
+    3. Large fixed-price project -> reject.
+    4. Professional role without explicit quick/simple wording -> reject.
+    5. Score must reach MIN_SIMPLE_SCORE.
     """
 
-    searchable = job.get("search_text", "")
+    searchable = (
+        job.get(
+            "search_text",
+            "",
+        )
+        or ""
+    )
 
     if not searchable:
         searchable = " ".join(
             [
-                job.get("title", ""),
-                job.get("description", ""),
-                " ".join(
-                    job.get("skills", [])
+                job.get(
+                    "title",
+                    "",
                 ),
-                job.get("rate", ""),
-                job.get("level", ""),
+                job.get(
+                    "description",
+                    "",
+                ),
+                " ".join(
+                    job.get(
+                        "skills",
+                        [],
+                    )
+                ),
+                job.get(
+                    "rate",
+                    "",
+                ),
+                job.get(
+                    "level",
+                    "",
+                ),
             ]
         )
+
+    title = (
+        job.get(
+            "title",
+            "",
+        )
+        or ""
+    )
 
     strong = _phrase_matches(
         searchable,
@@ -727,6 +842,17 @@ def evaluate_simple_job(
         EXCLUDE_KEYWORDS,
     )
 
+    role_complexity = _phrase_matches(
+        title,
+        ROLE_COMPLEXITY_SIGNALS,
+    )
+
+    fixed_budget_amount = (
+        _fixed_budget_amount(
+            job
+        )
+    )
+
     score = 0
 
     if strong:
@@ -747,7 +873,9 @@ def evaluate_simple_job(
     ):
         for value in group:
             if value not in positive_matches:
-                positive_matches.append(value)
+                positive_matches.append(
+                    value
+                )
 
     if excluded:
         return {
@@ -755,10 +883,14 @@ def evaluate_simple_job(
             "score": score,
             "reason": (
                 "excluded keyword: "
-                + ", ".join(excluded)
+                + ", ".join(
+                    excluded
+                )
             ),
             "matches": positive_matches,
             "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
         }
 
     if complexity:
@@ -767,10 +899,54 @@ def evaluate_simple_job(
             "score": score,
             "reason": (
                 "complex/long-term signal: "
-                + ", ".join(complexity)
+                + ", ".join(
+                    complexity
+                )
             ),
             "matches": positive_matches,
             "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
+        }
+
+    if (
+        fixed_budget_amount is not None
+        and fixed_budget_amount
+        > MAX_SIMPLE_FIXED_BUDGET
+    ):
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                "fixed budget "
+                f"${fixed_budget_amount:,.2f} "
+                "exceeds simple-job limit "
+                f"${MAX_SIMPLE_FIXED_BUDGET:,.2f}"
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
+        }
+
+    if (
+        role_complexity
+        and not simple
+    ):
+        return {
+            "accepted": False,
+            "score": score,
+            "reason": (
+                "professional role without "
+                "explicit quick/simple signal: "
+                + ", ".join(
+                    role_complexity
+                )
+            ),
+            "matches": positive_matches,
+            "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
         }
 
     if score < MIN_SIMPLE_SCORE:
@@ -783,14 +959,20 @@ def evaluate_simple_job(
             ),
             "matches": positive_matches,
             "complexity": complexity,
+            "role_complexity": role_complexity,
+            "fixed_budget": fixed_budget_amount,
         }
 
     return {
         "accepted": True,
         "score": score,
-        "reason": "simple-job filter matched",
+        "reason": (
+            "simple-job filter matched"
+        ),
         "matches": positive_matches,
         "complexity": complexity,
+        "role_complexity": role_complexity,
+        "fixed_budget": fixed_budget_amount,
     }
 
 
@@ -921,6 +1103,79 @@ async def send_telegram(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def minimize_browser_window(
+    page,
+) -> bool:
+    """
+    Minimize the headful Chrome window after the Upwork search page
+    has already passed Cloudflare and real job tiles are visible.
+
+    Cloudflare is intentionally allowed to run while the browser is
+    visible because that mode is already proven to work on this PC.
+    """
+
+    if not MINIMIZE_BROWSER_AFTER_READY:
+        print(
+            "BROWSER_WINDOW_STATUS="
+            "MINIMIZATION_DISABLED",
+            flush=True,
+        )
+
+        return False
+
+    try:
+        await page.minimize()
+
+        await asyncio.sleep(
+            0.35
+        )
+
+        _window_id, bounds = await page.get_window()
+
+        raw_state = getattr(
+            bounds,
+            "window_state",
+            "",
+        )
+
+        state_value = getattr(
+            raw_state,
+            "value",
+            raw_state,
+        )
+
+        state_text = str(
+            state_value
+        ).casefold()
+
+        if "minimized" in state_text:
+            print(
+                "BROWSER_WINDOW_STATUS=MINIMIZED",
+                flush=True,
+            )
+
+            return True
+
+        print(
+            "BROWSER_WINDOW_STATUS="
+            "MINIMIZE_UNCONFIRMED "
+            f"state={state_value!r}",
+            flush=True,
+        )
+
+        return False
+
+    except Exception as exc:
+        print(
+            "BROWSER_WINDOW_STATUS="
+            "MINIMIZE_FAILED "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return False
+
+
 async def wait_for_search_ready(
     page,
 ) -> int:
@@ -1021,6 +1276,10 @@ async def run_monitor(
         print(
             f"Browser tiles ready: {browser_tile_count}",
             flush=True,
+        )
+
+        await minimize_browser_window(
+            page
         )
 
         await asyncio.sleep(2)

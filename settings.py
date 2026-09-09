@@ -2,8 +2,8 @@
 Configuration for the Windows US-only Upwork monitor.
 
 Goal:
-surface small/simple jobs across multiple unrelated categories rather
-than jobs from one profession.
+surface genuinely small/simple jobs across several unrelated categories
+while aggressively rejecting substantial professional projects.
 """
 
 # ======================================================================
@@ -14,10 +14,19 @@ SEARCH_URLS = [
     "https://www.upwork.com/nx/search/jobs/?location=United%2520States&sort=recency",
 ]
 
-# Individual job page must confirm this exact client country.
 REQUIRED_CLIENT_COUNTRY = "United States"
 
 SEARCH_READY_TIMEOUT_SECONDS = 30
+
+
+# ======================================================================
+# Browser behavior
+# ======================================================================
+
+# Keep normal/headful Chrome for Cloudflare compatibility.
+# After the real Upwork search page becomes ready, minimize the window.
+MINIMIZE_BROWSER_AFTER_READY = True
+
 
 # ======================================================================
 # Simple-job scoring
@@ -25,12 +34,15 @@ SEARCH_READY_TIMEOUT_SECONDS = 30
 
 MIN_SIMPLE_SCORE = 5
 
+# A fixed-price project larger than this is assumed not to be the kind
+# of tiny/quick job this monitor is intended to surface.
+MAX_SIMPLE_FIXED_BUDGET = 500.0
+
 
 # ======================================================================
 # Strong simple-job subjects
 #
-# Any match here contributes +5 and can qualify the job by itself,
-# unless a hard complexity signal rejects it.
+# Any match contributes +5.
 # ======================================================================
 
 STRONG_SIMPLE_KEYWORDS = (
@@ -203,13 +215,7 @@ STRONG_SIMPLE_KEYWORDS = (
 # ======================================================================
 # Broad technical subjects
 #
-# These contribute only +2.
-# They need a SIMPLE_SIGNALS match (+3) to reach score 5.
-#
-# Example:
-#
-#   "Python developer"             -> reject
-#   "Quick Python script"          -> accept
+# A broad subject contributes only +2 and needs a SIMPLE_SIGNAL (+3).
 # ======================================================================
 
 BROAD_TOPIC_KEYWORDS = (
@@ -233,7 +239,7 @@ BROAD_TOPIC_KEYWORDS = (
 
 
 # ======================================================================
-# Explicit small/quick-work language
+# Explicit quick/simple language
 # ======================================================================
 
 SIMPLE_SIGNALS = (
@@ -275,14 +281,9 @@ SIMPLE_SIGNALS = (
 
 
 # ======================================================================
-# Hard complexity / long engagement signals
+# Hard complexity / long-engagement signals
 #
-# Any of these rejects the job.
-#
-# IMPORTANT:
-# "machine learning" and "deep learning" are intentionally NOT here.
-# A simple image-labeling/CVAT task may support an ML project without
-# being technically difficult itself.
+# Any match rejects the job.
 # ======================================================================
 
 COMPLEXITY_SIGNALS = (
@@ -321,10 +322,41 @@ COMPLEXITY_SIGNALS = (
 
 
 # ======================================================================
-# Explicit exclusions
+# Professional-role signals
 #
-# Keep empty for now.
-# We can populate this later from real false-positive alerts.
+# These are checked against the TITLE only.
+#
+# A demanding professional role is rejected unless the job also contains
+# an explicit simple/quick signal.
+#
+# Examples:
+#
+#   "Expert ecommerce web developer needed"    -> reject
+#   "TikTok Shop Manager"                      -> reject
+#   "Executive Assistant with AI Expertise"    -> reject
+#   "Quick Python developer fix"               -> may pass
+# ======================================================================
+
+ROLE_COMPLEXITY_SIGNALS = (
+    "developer",
+    "engineer",
+    "architect",
+    "manager",
+    "executive assistant",
+    "virtual assistant",
+    "consultant",
+    "accountant",
+    "cpa",
+    "bookkeeper",
+    "auditor",
+    "attorney",
+    "lawyer",
+    "recruiter",
+)
+
+
+# ======================================================================
+# Explicit exclusions
 # ======================================================================
 
 EXCLUDE_KEYWORDS = (
