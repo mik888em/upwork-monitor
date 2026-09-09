@@ -19,6 +19,9 @@ venv/
 # Debug files
 debug_client.log
 
+# Local operator filters
+exclude_keywords.txt
+
 # Local Upwork validation artifacts
 _smoke/
 _smoke_nodriver.py
