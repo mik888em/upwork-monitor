@@ -318,6 +318,18 @@ COMPLEXITY_SIGNALS = (
     "team of developers",
     "enterprise application",
     "enterprise system",
+
+    # Professional live-event work.
+    # These may contain words like "testing" or "5 minutes" but are
+    # not the tiny remote tasks this monitor is intended to surface.
+    "camera operator",
+    "livestream camera",
+    "live stream camera",
+    "live-stream camera",
+    "trade show",
+    "event videographer",
+    "event photographer",
+    "live event production",
 )
 
 
@@ -366,3 +378,4 @@ EXCLUDE_KEYWORDS = (
 COUNTRY_FLAGS = {
     "United States": "🇺🇸",
 }
+
