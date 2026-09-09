@@ -1,0 +1,17 @@
+# Local hard-exclusion keywords for the Upwork monitor.
+#
+# Copy/use this format in:
+#   C:\UpworkMonitor\exclude_keywords.txt
+#
+# Rules:
+# - one keyword or phrase per line
+# - matching is case-insensitive
+# - blank lines are ignored
+# - lines beginning with # are comments
+# - these are HARD exclusions and override positive/simple-job matches
+#
+# Example:
+shopify
+# woocommerce
+# tiktok shop
+# video editing
