@@ -35,11 +35,26 @@ DOM_READY_STABLE_SECONDS = 2
 # the monitor exits immediately without touching Upwork during the cooldown.
 UPWORK_READY_FAILURE_THRESHOLD = 3
 
-# Cooldown after the breaker opens.
-UPWORK_COOLDOWN_MINUTES = 30
+# Adaptive cooldown after repeated failed recovery probes.
+#
+# First breaker opening:  30 minutes
+# Failed probe after that: 60 minutes
+# Then:                    120 minutes
+# Maximum:                 240 minutes (4 hours)
+#
+# A successful Upwork readiness check resets the next cooldown back to 30.
+UPWORK_COOLDOWN_STEPS_MINUTES = (
+    30,
+    60,
+    120,
+    240,
+)
 
-# Send one degraded alert when the breaker first opens and one recovered
-# alert when Upwork becomes ready again.
+# After this many uninterrupted degraded hours, send one additional rare
+# health notification. It is reset after real recovery.
+UPWORK_LONG_DEGRADED_ALERT_HOURS = 6
+
+# Send degraded / long-degraded / recovered health notifications.
 HEALTH_ALERTS_ENABLED = True
 
 

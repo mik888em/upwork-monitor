@@ -51,7 +51,8 @@ from settings import (
     SEARCH_URLS,
     SIMPLE_SIGNALS,
     STRONG_SIMPLE_KEYWORDS,
-    UPWORK_COOLDOWN_MINUTES,
+    UPWORK_COOLDOWN_STEPS_MINUTES,
+    UPWORK_LONG_DEGRADED_ALERT_HOURS,
     UPWORK_READY_FAILURE_THRESHOLD,
 )
 
@@ -228,10 +229,27 @@ def _default_health_state() -> dict:
         "consecutive_ready_failures": 0,
         "cooldown_until": "",
         "degraded_notified": False,
+        "degraded_since": "",
+        "long_degraded_notified": False,
+        "backoff_level": 0,
+        "last_cooldown_minutes": 0,
         "last_failure_kind": "",
         "last_failure_at": "",
         "last_success_at": "",
     }
+
+
+def _coerce_nonnegative_int(
+    value,
+    default: int = 0,
+) -> int:
+    try:
+        return max(
+            0,
+            int(value),
+        )
+    except (TypeError, ValueError):
+        return default
 
 
 def load_health_state() -> dict:
@@ -240,49 +258,62 @@ def load_health_state() -> dict:
         exist_ok=True,
     )
 
-    state = _default_health_state()
-
-    if not HEALTH_STATE_FILE.is_file():
-        return state
-
-    try:
-        raw = json.loads(
-            HEALTH_STATE_FILE.read_text(
-                encoding="utf-8"
-            )
-        )
-    except Exception:
-        return state
-
-    if not isinstance(
-        raw,
-        dict,
-    ):
-        return state
-
-    state.update(
-        {
-            key: raw.get(
-                key,
-                default_value,
-            )
-            for key, default_value
-            in state.items()
-        }
+    defaults = _default_health_state()
+    state = dict(
+        defaults
     )
 
-    try:
-        state["consecutive_ready_failures"] = max(
-            0,
-            int(
-                state.get(
-                    "consecutive_ready_failures",
-                    0,
+    raw = {}
+
+    if HEALTH_STATE_FILE.is_file():
+        try:
+            loaded = json.loads(
+                HEALTH_STATE_FILE.read_text(
+                    encoding="utf-8"
                 )
-            ),
+            )
+
+            if isinstance(
+                loaded,
+                dict,
+            ):
+                raw = loaded
+
+        except Exception:
+            raw = {}
+
+    for key, default_value in defaults.items():
+        state[key] = raw.get(
+            key,
+            default_value,
         )
-    except (TypeError, ValueError):
-        state["consecutive_ready_failures"] = 0
+
+    state["consecutive_ready_failures"] = (
+        _coerce_nonnegative_int(
+            state.get(
+                "consecutive_ready_failures",
+                0,
+            )
+        )
+    )
+
+    state["backoff_level"] = (
+        _coerce_nonnegative_int(
+            state.get(
+                "backoff_level",
+                0,
+            )
+        )
+    )
+
+    state["last_cooldown_minutes"] = (
+        _coerce_nonnegative_int(
+            state.get(
+                "last_cooldown_minutes",
+                0,
+            )
+        )
+    )
 
     state["degraded_notified"] = bool(
         state.get(
@@ -290,6 +321,73 @@ def load_health_state() -> dict:
             False,
         )
     )
+
+    state["long_degraded_notified"] = bool(
+        state.get(
+            "long_degraded_notified",
+            False,
+        )
+    )
+
+    # Migration from Health Guard V3:
+    # if the old state is already in/after its first 30-minute cooldown,
+    # the NEXT failed recovery probe should escalate to 60 minutes.
+    if "backoff_level" not in raw:
+        if (
+            state["consecutive_ready_failures"]
+            >= UPWORK_READY_FAILURE_THRESHOLD
+            or str(
+                state.get(
+                    "cooldown_until",
+                    "",
+                )
+                or ""
+            )
+        ):
+            state["backoff_level"] = 1
+
+            if (
+                state["last_cooldown_minutes"]
+                <= 0
+            ):
+                state["last_cooldown_minutes"] = (
+                    int(
+                        UPWORK_COOLDOWN_STEPS_MINUTES[0]
+                    )
+                )
+
+    max_level = max(
+        0,
+        len(
+            UPWORK_COOLDOWN_STEPS_MINUTES
+        )
+        - 1,
+    )
+
+    state["backoff_level"] = min(
+        state["backoff_level"],
+        max_level,
+    )
+
+    # V3 did not have degraded_since. Use its latest known failure as a
+    # conservative migration point, rather than inventing an earlier outage.
+    if (
+        not str(
+            state.get(
+                "degraded_since",
+                "",
+            )
+            or ""
+        )
+        and state["consecutive_ready_failures"] > 0
+    ):
+        state["degraded_since"] = str(
+            state.get(
+                "last_failure_at",
+                "",
+            )
+            or ""
+        )
 
     return state
 
@@ -348,6 +446,178 @@ def cooldown_remaining_seconds(
         seconds,
     )
 
+
+def cooldown_minutes_for_level(
+    level: int,
+) -> int:
+    steps = tuple(
+        int(value)
+        for value
+        in UPWORK_COOLDOWN_STEPS_MINUTES
+    )
+
+    if not steps:
+        return 30
+
+    index = min(
+        max(
+            0,
+            _coerce_nonnegative_int(
+                level
+            ),
+        ),
+        len(steps) - 1,
+    )
+
+    return steps[index]
+
+
+def _elapsed_seconds_since(
+    value: str,
+):
+    parsed = _parse_utc(
+        str(
+            value
+            or ""
+        )
+    )
+
+    if parsed is None:
+        return None
+
+    return max(
+        0.0,
+        (
+            _utc_now()
+            - parsed
+        ).total_seconds(),
+    )
+
+
+def hours_since_last_success(
+    state: dict,
+):
+    seconds = _elapsed_seconds_since(
+        str(
+            state.get(
+                "last_success_at",
+                "",
+            )
+            or ""
+        )
+    )
+
+    if seconds is None:
+        return None
+
+    return (
+        seconds
+        / 3600.0
+    )
+
+
+def degraded_hours(
+    state: dict,
+):
+    seconds = _elapsed_seconds_since(
+        str(
+            state.get(
+                "degraded_since",
+                "",
+            )
+            or ""
+        )
+    )
+
+    if seconds is None:
+        return None
+
+    return (
+        seconds
+        / 3600.0
+    )
+
+
+def log_health_status(
+    state: dict,
+) -> None:
+    last_success = str(
+        state.get(
+            "last_success_at",
+            "",
+        )
+        or ""
+    )
+
+    if last_success:
+        print(
+            f"LAST_SUCCESS_AT={last_success}",
+            flush=True,
+        )
+    else:
+        print(
+            "LAST_SUCCESS_AT=UNKNOWN",
+            flush=True,
+        )
+
+    success_hours = hours_since_last_success(
+        state
+    )
+
+    if success_hours is None:
+        print(
+            "HOURS_SINCE_LAST_SUCCESS=UNKNOWN",
+            flush=True,
+        )
+    else:
+        print(
+            "HOURS_SINCE_LAST_SUCCESS="
+            f"{success_hours:.2f}",
+            flush=True,
+        )
+
+    degraded_since = str(
+        state.get(
+            "degraded_since",
+            "",
+        )
+        or ""
+    )
+
+    if degraded_since:
+        print(
+            f"DEGRADED_SINCE={degraded_since}",
+            flush=True,
+        )
+
+        outage_hours = degraded_hours(
+            state
+        )
+
+        if outage_hours is not None:
+            print(
+                "DEGRADED_HOURS="
+                f"{outage_hours:.2f}",
+                flush=True,
+            )
+
+    print(
+        "BACKOFF_LEVEL="
+        f"{_coerce_nonnegative_int(state.get('backoff_level', 0))}",
+        flush=True,
+    )
+
+    print(
+        "LAST_COOLDOWN_MINUTES="
+        f"{_coerce_nonnegative_int(state.get('last_cooldown_minutes', 0))}",
+        flush=True,
+    )
+
+    print(
+        "NEXT_COOLDOWN_MINUTES="
+        f"{cooldown_minutes_for_level(state.get('backoff_level', 0))}",
+        flush=True,
+    )
 
 
 
@@ -1399,6 +1669,88 @@ async def send_health_telegram(
     return True
 
 
+async def maybe_send_long_degraded_alert(
+    state: dict,
+) -> bool:
+    if not HEALTH_ALERTS_ENABLED:
+        return False
+
+    if bool(
+        state.get(
+            "long_degraded_notified",
+            False,
+        )
+    ):
+        return False
+
+    outage_hours = degraded_hours(
+        state
+    )
+
+    if outage_hours is None:
+        return False
+
+    if (
+        outage_hours
+        < float(
+            UPWORK_LONG_DEGRADED_ALERT_HOURS
+        )
+    ):
+        return False
+
+    last_success = str(
+        state.get(
+            "last_success_at",
+            "",
+        )
+        or "unknown"
+    )
+
+    last_failure_kind = str(
+        state.get(
+            "last_failure_kind",
+            "",
+        )
+        or "unknown"
+    )
+
+    current_cooldown = (
+        _coerce_nonnegative_int(
+            state.get(
+                "last_cooldown_minutes",
+                0,
+            )
+        )
+    )
+
+    message = (
+        "⚠ Upwork Monitor still degraded\n"
+        "Upwork search has not recovered for "
+        f"{outage_hours:.1f} hours.\n"
+        f"Last successful readiness: {last_success}.\n"
+        f"Last failure: {last_failure_kind}.\n"
+        f"Current backoff: {current_cooldown} minutes."
+    )
+
+    sent = await send_health_telegram(
+        message
+    )
+
+    if sent:
+        state["long_degraded_notified"] = True
+
+        print(
+            "HEALTH_ALERT_SENT=LONG_DEGRADED",
+            flush=True,
+        )
+
+        save_health_state(
+            state
+        )
+
+    return sent
+
+
 async def register_ready_failure(
     error: UpworkReadyTimeout,
 ) -> None:
@@ -1421,6 +1773,17 @@ async def register_ready_failure(
         now
     )
 
+    if not str(
+        state.get(
+            "degraded_since",
+            "",
+        )
+        or ""
+    ):
+        state["degraded_since"] = _utc_iso(
+            now
+        )
+
     print(
         f"READY_FAILURE_COUNT={failures}",
         flush=True,
@@ -1430,15 +1793,45 @@ async def register_ready_failure(
         failures
         >= UPWORK_READY_FAILURE_THRESHOLD
     ):
+        level = _coerce_nonnegative_int(
+            state.get(
+                "backoff_level",
+                0,
+            )
+        )
+
+        cooldown_minutes = (
+            cooldown_minutes_for_level(
+                level
+            )
+        )
+
         cooldown_until = (
             now
             + timedelta(
-                minutes=UPWORK_COOLDOWN_MINUTES
+                minutes=cooldown_minutes
             )
         )
 
         state["cooldown_until"] = _utc_iso(
             cooldown_until
+        )
+
+        state["last_cooldown_minutes"] = (
+            cooldown_minutes
+        )
+
+        max_level = max(
+            0,
+            len(
+                UPWORK_COOLDOWN_STEPS_MINUTES
+            )
+            - 1,
+        )
+
+        state["backoff_level"] = min(
+            level + 1,
+            max_level,
         )
 
         print(
@@ -1448,13 +1841,19 @@ async def register_ready_failure(
 
         print(
             "COOLDOWN_MINUTES="
-            f"{UPWORK_COOLDOWN_MINUTES}",
+            f"{cooldown_minutes}",
             flush=True,
         )
 
         print(
             "COOLDOWN_UNTIL="
             f"{state['cooldown_until']}",
+            flush=True,
+        )
+
+        print(
+            "NEXT_COOLDOWN_MINUTES="
+            f"{cooldown_minutes_for_level(state['backoff_level'])}",
             flush=True,
         )
 
@@ -1469,7 +1868,7 @@ async def register_ready_failure(
                 f"Upwork readiness failed {failures} consecutive times.\n"
                 f"Last failure: {error.kind}.\n"
                 "Monitoring entered a "
-                f"{UPWORK_COOLDOWN_MINUTES}-minute cooldown."
+                f"{cooldown_minutes}-minute cooldown."
             )
 
             sent = await send_health_telegram(
@@ -1493,6 +1892,14 @@ async def register_ready_failure(
         )
 
     save_health_state(
+        state
+    )
+
+    await maybe_send_long_degraded_alert(
+        state
+    )
+
+    log_health_status(
         state
     )
 
@@ -1527,16 +1934,38 @@ async def register_ready_success() -> None:
         or failures
         >= UPWORK_READY_FAILURE_THRESHOLD
         or had_cooldown
+        or bool(
+            str(
+                state.get(
+                    "degraded_since",
+                    "",
+                )
+                or ""
+            )
+        )
+    )
+
+    outage_hours = degraded_hours(
+        state
     )
 
     if (
         was_degraded
         and HEALTH_ALERTS_ENABLED
     ):
+        downtime_text = ""
+
+        if outage_hours is not None:
+            downtime_text = (
+                "\nContinuous degradation lasted about "
+                f"{outage_hours:.1f} hours."
+            )
+
         sent = await send_health_telegram(
             "✅ Upwork Monitor recovered\n"
             "Upwork search is ready again.\n"
-            "Normal 5-minute monitoring resumed."
+            "Adaptive backoff reset to 30 minutes."
+            + downtime_text
         )
 
         if sent:
@@ -1548,6 +1977,10 @@ async def register_ready_success() -> None:
     state["consecutive_ready_failures"] = 0
     state["cooldown_until"] = ""
     state["degraded_notified"] = False
+    state["degraded_since"] = ""
+    state["long_degraded_notified"] = False
+    state["backoff_level"] = 0
+    state["last_cooldown_minutes"] = 0
     state["last_failure_kind"] = ""
     state["last_success_at"] = _utc_iso(
         _utc_now()
@@ -1563,8 +1996,23 @@ async def register_ready_success() -> None:
     )
 
     print(
+        "BACKOFF_LEVEL_RESET=0",
+        flush=True,
+    )
+
+    print(
+        "NEXT_COOLDOWN_MINUTES="
+        f"{cooldown_minutes_for_level(0)}",
+        flush=True,
+    )
+
+    print(
         "CIRCUIT_STATUS=CLOSED",
         flush=True,
+    )
+
+    log_health_status(
+        state
     )
 
 
@@ -1790,6 +2238,10 @@ async def run_monitor(
     ):
         health = load_health_state()
 
+        log_health_status(
+            health
+        )
+
         remaining = cooldown_remaining_seconds(
             health
         )
@@ -1805,6 +2257,10 @@ async def run_monitor(
                 flush=True,
             )
 
+            await maybe_send_long_degraded_alert(
+                health
+            )
+
             print(
                 "RUN_RESULT=CIRCUIT_COOLDOWN",
                 flush=True,
@@ -1816,6 +2272,26 @@ async def run_monitor(
             )
 
             return
+
+        if (
+            int(
+                health.get(
+                    "consecutive_ready_failures",
+                    0,
+                )
+            )
+            >= UPWORK_READY_FAILURE_THRESHOLD
+        ):
+            print(
+                "CIRCUIT_STATUS=PROBE_AFTER_COOLDOWN",
+                flush=True,
+            )
+
+            print(
+                "PROBE_BACKOFF_LEVEL="
+                f"{_coerce_nonnegative_int(health.get('backoff_level', 0))}",
+                flush=True,
+            )
 
     seen = load_state()
 
