@@ -41,8 +41,6 @@ if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) {
     exit 12
 }
 
-# Production is forbidden if bootstrap state has disappeared.
-# This protects against accidentally treating all visible jobs as new.
 if (-not $DryRun) {
     if (-not (Test-Path -LiteralPath $StateFile -PathType Leaf)) {
         exit 13
@@ -90,19 +88,64 @@ Add-Content `
     -Value $Header `
     -Encoding utf8
 
-$Arguments = @(
-    $MonitorPy
+$NativeId = (
+    [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString() +
+    '_' +
+    [Guid]::NewGuid().ToString('N')
 )
 
-if ($DryRun) {
-    $Arguments += '--dry-run'
-}
+$StdoutFile = Join-Path `
+    $LogDir `
+    ("native_stdout_" + $NativeId + ".tmp")
 
-& $PythonExe @Arguments 2>&1 |
-    ForEach-Object {
+$StderrFile = Join-Path `
+    $LogDir `
+    ("native_stderr_" + $NativeId + ".tmp")
 
-        $Line = "$_"
+$ExitCode = 98
+$LauncherResult = 'UNKNOWN'
 
+try {
+    $Arguments = @(
+        $MonitorPy
+    )
+
+    if ($DryRun) {
+        $Arguments += '--dry-run'
+    }
+
+    $Process = Start-Process `
+        -FilePath $PythonExe `
+        -ArgumentList $Arguments `
+        -WorkingDirectory $ProjectDir `
+        -RedirectStandardOutput $StdoutFile `
+        -RedirectStandardError $StderrFile `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+
+    $ExitCode = $Process.ExitCode
+
+    $StdoutLines = @()
+    $StderrLines = @()
+
+    if (Test-Path -LiteralPath $StdoutFile -PathType Leaf) {
+        $StdoutLines = @(
+            Get-Content `
+                -LiteralPath $StdoutFile `
+                -Encoding UTF8
+        )
+    }
+
+    if (Test-Path -LiteralPath $StderrFile -PathType Leaf) {
+        $StderrLines = @(
+            Get-Content `
+                -LiteralPath $StderrFile `
+                -Encoding UTF8
+        )
+    }
+
+    foreach ($Line in $StdoutLines) {
         Add-Content `
             -LiteralPath $LogFile `
             -Value $Line `
@@ -111,18 +154,100 @@ if ($DryRun) {
         Write-Output $Line
     }
 
-$ExitCode = $LASTEXITCODE
+    if ($StderrLines.Count -gt 0) {
+        Add-Content `
+            -LiteralPath $LogFile `
+            -Value '--- PYTHON STDERR ---' `
+            -Encoding utf8
 
-$Footer = (
-    "RUN END " +
-    (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') +
-    " EXIT_CODE=" +
-    $ExitCode
-)
+        Write-Output '--- PYTHON STDERR ---'
 
-Add-Content `
-    -LiteralPath $LogFile `
-    -Value $Footer `
-    -Encoding utf8
+        foreach ($Line in $StderrLines) {
+            Add-Content `
+                -LiteralPath $LogFile `
+                -Value $Line `
+                -Encoding utf8
+
+            Write-Output $Line
+        }
+    }
+
+    $RunResultLines = @(
+        $StdoutLines |
+        Where-Object {
+            "$_" -match '^RUN_RESULT='
+        }
+    )
+
+    if ($RunResultLines.Count -gt 0) {
+        $LauncherResult = (
+            "$($RunResultLines[-1])" -replace '^RUN_RESULT=', ''
+        )
+    }
+    elseif ($ExitCode -eq 0) {
+        $LauncherResult = 'PROCESS_EXIT_0_NO_RUN_RESULT'
+    }
+    else {
+        $LauncherResult = (
+            'PROCESS_EXIT_' +
+            $ExitCode
+        )
+    }
+}
+catch {
+    $ExitCode = 98
+    $LauncherResult = 'LAUNCHER_EXCEPTION'
+
+    $ErrorLine = (
+        'LAUNCHER_ERROR=' +
+        $_.Exception.GetType().Name +
+        ': ' +
+        $_.Exception.Message
+    )
+
+    Add-Content `
+        -LiteralPath $LogFile `
+        -Value $ErrorLine `
+        -Encoding utf8
+
+    Write-Output $ErrorLine
+}
+finally {
+    $LauncherLine = (
+        'LAUNCHER_RUN_RESULT=' +
+        $LauncherResult
+    )
+
+    Add-Content `
+        -LiteralPath $LogFile `
+        -Value $LauncherLine `
+        -Encoding utf8
+
+    Write-Output $LauncherLine
+
+    $Footer = (
+        "RUN END " +
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') +
+        " EXIT_CODE=" +
+        $ExitCode
+    )
+
+    Add-Content `
+        -LiteralPath $LogFile `
+        -Value $Footer `
+        -Encoding utf8
+
+    Write-Output $Footer
+
+    Remove-Item `
+        -LiteralPath $StdoutFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    Remove-Item `
+        -LiteralPath $StderrFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+}
 
 exit $ExitCode

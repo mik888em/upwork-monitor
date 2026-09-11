@@ -19,7 +19,28 @@ SEARCH_URLS = [
 
 REQUIRED_CLIENT_COUNTRY = "United States"
 
-SEARCH_READY_TIMEOUT_SECONDS = 30
+SEARCH_READY_TIMEOUT_SECONDS = 45
+
+# The search page is considered ready only after both job tiles and real
+# title links are visible for this many consecutive checks.
+DOM_READY_STABLE_SECONDS = 2
+
+
+# ======================================================================
+# Upwork readiness circuit breaker
+# ======================================================================
+
+# After this many consecutive readiness failures, stop opening Chrome/Upwork
+# for a cooldown window. Task Scheduler can still wake every 5 minutes, but
+# the monitor exits immediately without touching Upwork during the cooldown.
+UPWORK_READY_FAILURE_THRESHOLD = 3
+
+# Cooldown after the breaker opens.
+UPWORK_COOLDOWN_MINUTES = 30
+
+# Send one degraded alert when the breaker first opens and one recovered
+# alert when Upwork becomes ready again.
+HEALTH_ALERTS_ENABLED = True
 
 
 # ======================================================================

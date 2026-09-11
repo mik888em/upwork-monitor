@@ -25,6 +25,8 @@ import msvcrt
 import os
 import re
 import sys
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -36,7 +38,9 @@ from settings import (
     BROAD_TOPIC_KEYWORDS,
     COMPLEXITY_SIGNALS,
     COUNTRY_FLAGS,
+    DOM_READY_STABLE_SECONDS,
     EXCLUDE_KEYWORDS,
+    HEALTH_ALERTS_ENABLED,
     ROLE_COMPLEXITY_SIGNALS,
     WEB_PROJECT_TITLE_SIGNALS,
     MINIMIZE_BROWSER_AFTER_READY,
@@ -47,6 +51,8 @@ from settings import (
     SEARCH_URLS,
     SIMPLE_SIGNALS,
     STRONG_SIMPLE_KEYWORDS,
+    UPWORK_COOLDOWN_MINUTES,
+    UPWORK_READY_FAILURE_THRESHOLD,
 )
 
 # ── Windows UTF-8 console ─────────────────────────────────────────────────────
@@ -155,6 +161,194 @@ def release_single_instance_lock(
 # ── State (global deduplication) ──────────────────────────────────────────────
 
 GLOBAL_STATE_FILE = STATE_DIR / "seen_global.json"
+
+HEALTH_STATE_FILE = STATE_DIR / "health.json"
+
+
+class UpworkReadyTimeout(RuntimeError):
+    def __init__(
+        self,
+        kind: str,
+        title: str,
+        tile_count: int,
+        link_count: int,
+    ) -> None:
+        self.kind = kind
+        self.title = title
+        self.tile_count = tile_count
+        self.link_count = link_count
+
+        super().__init__(
+            "Upwork search did not become fully ready "
+            f"within {SEARCH_READY_TIMEOUT_SECONDS} seconds "
+            f"(kind={kind}, title={title!r}, "
+            f"tiles={tile_count}, links={link_count})."
+        )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def _utc_iso(
+    value: datetime,
+) -> str:
+    return value.astimezone(
+        timezone.utc
+    ).isoformat()
+
+
+def _parse_utc(
+    value: str,
+):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            value
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
+        )
+
+    return parsed.astimezone(
+        timezone.utc
+    )
+
+
+def _default_health_state() -> dict:
+    return {
+        "consecutive_ready_failures": 0,
+        "cooldown_until": "",
+        "degraded_notified": False,
+        "last_failure_kind": "",
+        "last_failure_at": "",
+        "last_success_at": "",
+    }
+
+
+def load_health_state() -> dict:
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    state = _default_health_state()
+
+    if not HEALTH_STATE_FILE.is_file():
+        return state
+
+    try:
+        raw = json.loads(
+            HEALTH_STATE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return state
+
+    if not isinstance(
+        raw,
+        dict,
+    ):
+        return state
+
+    state.update(
+        {
+            key: raw.get(
+                key,
+                default_value,
+            )
+            for key, default_value
+            in state.items()
+        }
+    )
+
+    try:
+        state["consecutive_ready_failures"] = max(
+            0,
+            int(
+                state.get(
+                    "consecutive_ready_failures",
+                    0,
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        state["consecutive_ready_failures"] = 0
+
+    state["degraded_notified"] = bool(
+        state.get(
+            "degraded_notified",
+            False,
+        )
+    )
+
+    return state
+
+
+def save_health_state(
+    state: dict,
+) -> None:
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = HEALTH_STATE_FILE.with_suffix(
+        ".tmp"
+    )
+
+    tmp.write_text(
+        json.dumps(
+            state,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    tmp.replace(
+        HEALTH_STATE_FILE
+    )
+
+
+def cooldown_remaining_seconds(
+    state: dict,
+) -> int:
+    until = _parse_utc(
+        str(
+            state.get(
+                "cooldown_until",
+                "",
+            )
+            or ""
+        )
+    )
+
+    if until is None:
+        return 0
+
+    seconds = int(
+        (
+            until
+            - _utc_now()
+        ).total_seconds()
+    )
+
+    return max(
+        0,
+        seconds,
+    )
+
+
 
 
 def load_state() -> set[str]:
@@ -1141,6 +1335,239 @@ async def send_telegram(
         )
 
 
+
+async def send_health_telegram(
+    text: str,
+) -> bool:
+    # Plain-text health notification. Errors are logged but never raised.
+
+    if not HEALTH_ALERTS_ENABLED:
+        print(
+            "HEALTH_ALERT_STATUS=DISABLED",
+            flush=True,
+        )
+        return False
+
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHANNEL
+    ):
+        print(
+            "HEALTH_ALERT_STATUS=CONFIG_MISSING",
+            flush=True,
+        )
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}"
+        "/sendMessage"
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHANNEL,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=20,
+            )
+
+    except Exception as exc:
+        print(
+            "HEALTH_ALERT_STATUS=ERROR "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+
+    print(
+        f"HEALTH_TG={response.status_code}",
+        flush=True,
+    )
+
+    if response.status_code != 200:
+        print(
+            "HEALTH_ALERT_STATUS=HTTP_ERROR",
+            flush=True,
+        )
+        return False
+
+    return True
+
+
+async def register_ready_failure(
+    error: UpworkReadyTimeout,
+) -> None:
+    state = load_health_state()
+    now = _utc_now()
+
+    failures = (
+        int(
+            state.get(
+                "consecutive_ready_failures",
+                0,
+            )
+        )
+        + 1
+    )
+
+    state["consecutive_ready_failures"] = failures
+    state["last_failure_kind"] = error.kind
+    state["last_failure_at"] = _utc_iso(
+        now
+    )
+
+    print(
+        f"READY_FAILURE_COUNT={failures}",
+        flush=True,
+    )
+
+    if (
+        failures
+        >= UPWORK_READY_FAILURE_THRESHOLD
+    ):
+        cooldown_until = (
+            now
+            + timedelta(
+                minutes=UPWORK_COOLDOWN_MINUTES
+            )
+        )
+
+        state["cooldown_until"] = _utc_iso(
+            cooldown_until
+        )
+
+        print(
+            "CIRCUIT_STATUS=OPEN",
+            flush=True,
+        )
+
+        print(
+            "COOLDOWN_MINUTES="
+            f"{UPWORK_COOLDOWN_MINUTES}",
+            flush=True,
+        )
+
+        print(
+            "COOLDOWN_UNTIL="
+            f"{state['cooldown_until']}",
+            flush=True,
+        )
+
+        if not bool(
+            state.get(
+                "degraded_notified",
+                False,
+            )
+        ):
+            message = (
+                "⚠ Upwork Monitor degraded\n"
+                f"Upwork readiness failed {failures} consecutive times.\n"
+                f"Last failure: {error.kind}.\n"
+                "Monitoring entered a "
+                f"{UPWORK_COOLDOWN_MINUTES}-minute cooldown."
+            )
+
+            sent = await send_health_telegram(
+                message
+            )
+
+            if sent:
+                state["degraded_notified"] = True
+
+                print(
+                    "HEALTH_ALERT_SENT=DEGRADED",
+                    flush=True,
+                )
+
+    else:
+        state["cooldown_until"] = ""
+
+        print(
+            "CIRCUIT_STATUS=CLOSED",
+            flush=True,
+        )
+
+    save_health_state(
+        state
+    )
+
+
+async def register_ready_success() -> None:
+    state = load_health_state()
+
+    failures = int(
+        state.get(
+            "consecutive_ready_failures",
+            0,
+        )
+    )
+
+    had_cooldown = bool(
+        str(
+            state.get(
+                "cooldown_until",
+                "",
+            )
+            or ""
+        )
+    )
+
+    was_degraded = (
+        bool(
+            state.get(
+                "degraded_notified",
+                False,
+            )
+        )
+        or failures
+        >= UPWORK_READY_FAILURE_THRESHOLD
+        or had_cooldown
+    )
+
+    if (
+        was_degraded
+        and HEALTH_ALERTS_ENABLED
+    ):
+        sent = await send_health_telegram(
+            "✅ Upwork Monitor recovered\n"
+            "Upwork search is ready again.\n"
+            "Normal 5-minute monitoring resumed."
+        )
+
+        if sent:
+            print(
+                "HEALTH_ALERT_SENT=RECOVERED",
+                flush=True,
+            )
+
+    state["consecutive_ready_failures"] = 0
+    state["cooldown_until"] = ""
+    state["degraded_notified"] = False
+    state["last_failure_kind"] = ""
+    state["last_success_at"] = _utc_iso(
+        _utc_now()
+    )
+
+    save_health_state(
+        state
+    )
+
+    print(
+        "READY_FAILURE_COUNT=0",
+        flush=True,
+    )
+
+    print(
+        "CIRCUIT_STATUS=CLOSED",
+        flush=True,
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def minimize_browser_window(
@@ -1219,12 +1646,12 @@ async def minimize_browser_window(
 async def wait_for_search_ready(
     page,
 ) -> int:
-    """
-    Wait until the real Upwork search results appear.
+    # Require both job tiles and hydrated title links to be stable.
 
-    We do not click or solve a challenge. We only wait for the same
-    automatic Cloudflare transition already verified on this machine.
-    """
+    stable_ready = 0
+    last_title = ""
+    last_tile_count = 0
+    last_link_count = 0
 
     for second in range(
         1,
@@ -1249,24 +1676,95 @@ async def wait_for_search_ready(
             tile_count = 0
 
         try:
-            tile_count = int(tile_count)
+            link_count = await page.evaluate(
+                "document.querySelectorAll("
+                "\"article.job-tile "
+                "[data-test*='job-tile-title-link'][href], "
+                "article.job-tile "
+                "[data-test*='job-tile-title'] a[href], "
+                "article.job-tile h2 a[href]\""
+                ").length"
+            )
+        except Exception:
+            link_count = 0
+
+        try:
+            tile_count = int(
+                tile_count
+            )
         except Exception:
             tile_count = 0
 
+        try:
+            link_count = int(
+                link_count
+            )
+        except Exception:
+            link_count = 0
+
+        last_title = str(
+            title
+            or ""
+        )
+
+        last_tile_count = tile_count
+        last_link_count = link_count
+
+        if (
+            tile_count > 0
+            and link_count > 0
+        ):
+            stable_ready += 1
+        else:
+            stable_ready = 0
+
         print(
             f"  ready={second:02d}s "
-            f"title={str(title)!r} "
-            f"tiles={tile_count}",
+            f"title={last_title!r} "
+            f"tiles={tile_count} "
+            f"links={link_count} "
+            f"stable={stable_ready}/"
+            f"{DOM_READY_STABLE_SECONDS}",
             flush=True,
         )
 
-        if tile_count > 0:
+        if (
+            stable_ready
+            >= DOM_READY_STABLE_SECONDS
+        ):
             return tile_count
 
-    raise RuntimeError(
-        "Upwork search results did not become ready "
-        f"within {SEARCH_READY_TIMEOUT_SECONDS} seconds."
+    folded_title = last_title.casefold()
+
+    challenge_markers = (
+        "just a moment",
+        "verify you are human",
+        "verification",
+        "checking your browser",
     )
+
+    if any(
+        marker in folded_title
+        for marker in challenge_markers
+    ):
+        kind = "CLOUDFLARE"
+
+    elif (
+        last_tile_count > 0
+        and last_link_count == 0
+    ):
+        kind = "DOM_LINKS"
+
+    else:
+        kind = "UPWORK_READY"
+
+    raise UpworkReadyTimeout(
+        kind=kind,
+        title=last_title,
+        tile_count=last_tile_count,
+        link_count=last_link_count,
+    )
+
 
 
 def _save_seen_after_change(
@@ -1285,6 +1783,39 @@ async def run_monitor(
     dry_run: bool,
     bootstrap: bool,
 ) -> None:
+
+    if (
+        not dry_run
+        and not bootstrap
+    ):
+        health = load_health_state()
+
+        remaining = cooldown_remaining_seconds(
+            health
+        )
+
+        if remaining > 0:
+            print(
+                "CIRCUIT_STATUS=COOLDOWN",
+                flush=True,
+            )
+
+            print(
+                f"COOLDOWN_REMAINING_SECONDS={remaining}",
+                flush=True,
+            )
+
+            print(
+                "RUN_RESULT=CIRCUIT_COOLDOWN",
+                flush=True,
+            )
+
+            print(
+                "RUN_STATUS=OK",
+                flush=True,
+            )
+
+            return
 
     seen = load_state()
 
@@ -1309,9 +1840,35 @@ async def run_monitor(
             search_url
         )
 
-        browser_tile_count = await wait_for_search_ready(
-            page
-        )
+        try:
+            browser_tile_count = await wait_for_search_ready(
+                page
+            )
+
+        except UpworkReadyTimeout as exc:
+            if (
+                not dry_run
+                and not bootstrap
+            ):
+                await register_ready_failure(
+                    exc
+                )
+
+            print(
+                "RUN_RESULT="
+                "UPWORK_READY_TIMEOUT_"
+                f"{exc.kind}",
+                flush=True,
+            )
+
+            raise
+
+        else:
+            if (
+                not dry_run
+                and not bootstrap
+            ):
+                await register_ready_success()
 
         print(
             f"Browser tiles ready: {browser_tile_count}",
@@ -1341,6 +1898,11 @@ async def run_monitor(
         )
 
         if not jobs:
+            print(
+                "RUN_RESULT=PARSER_NO_JOBS",
+                flush=True,
+            )
+
             raise RuntimeError(
                 "No jobs parsed from current Upwork search."
             )
@@ -1377,6 +1939,11 @@ async def run_monitor(
 
             print(
                 "BOOTSTRAP_STATUS=OK",
+                flush=True,
+            )
+
+            print(
+                "RUN_RESULT=BOOTSTRAP_OK",
                 flush=True,
             )
 
@@ -1559,10 +2126,20 @@ async def run_monitor(
 
         if dry_run:
             print(
+                "RUN_RESULT=DRY_RUN_OK",
+                flush=True,
+            )
+
+            print(
                 "DRY_RUN_STATUS=OK",
                 flush=True,
             )
         else:
+            print(
+                "RUN_RESULT=OK",
+                flush=True,
+            )
+
             print(
                 "RUN_STATUS=OK",
                 flush=True,
@@ -1613,6 +2190,11 @@ if __name__ == "__main__":
             flush=True,
         )
 
+        print(
+            "RUN_RESULT=SKIPPED_ALREADY_RUNNING",
+            flush=True,
+        )
+
         sys.exit(0)
 
     print(
@@ -1620,24 +2202,65 @@ if __name__ == "__main__":
         flush=True,
     )
 
+    exit_code = 0
+
     try:
         args = parse_cli_args()
 
         if args.dry_run and args.bootstrap:
+            print(
+                "RUN_RESULT=CLI_ERROR",
+                flush=True,
+            )
+
             print(
                 "ERROR: use either --dry-run "
                 "or --bootstrap, not both.",
                 flush=True,
             )
 
-            sys.exit(2)
+            exit_code = 2
 
-        uc.loop().run_until_complete(
-            run_monitor(
-                dry_run=args.dry_run,
-                bootstrap=args.bootstrap,
+        else:
+            uc.loop().run_until_complete(
+                run_monitor(
+                    dry_run=args.dry_run,
+                    bootstrap=args.bootstrap,
+                )
             )
+
+    except UpworkReadyTimeout as exc:
+        print(
+            f"ERROR_TYPE={type(exc).__name__}",
+            flush=True,
         )
+
+        print(
+            f"ERROR_MESSAGE={exc}",
+            flush=True,
+        )
+
+        exit_code = 1
+
+    except Exception as exc:
+        print(
+            "RUN_RESULT=UNHANDLED_EXCEPTION",
+            flush=True,
+        )
+
+        print(
+            f"ERROR_TYPE={type(exc).__name__}",
+            flush=True,
+        )
+
+        print(
+            f"ERROR_MESSAGE={exc}",
+            flush=True,
+        )
+
+        traceback.print_exc()
+
+        exit_code = 1
 
     finally:
         release_single_instance_lock(
@@ -1648,3 +2271,7 @@ if __name__ == "__main__":
             "SINGLE_INSTANCE_STATUS=RELEASED",
             flush=True,
         )
+
+    sys.exit(
+        exit_code
+    )
